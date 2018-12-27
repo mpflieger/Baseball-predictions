@@ -1,0 +1,166 @@
+#My goal is to predict World Series Winners for upcoming MLB seasons
+
+#read in the data and clean
+teams <- read.csv("teams.csv")
+
+#Using only the variables I think are relevant
+myteams <- subset(teams, yearID > 1969)[,c("teamID","yearID","W","L","R","RA","DivWin","BB","SB","WSWin")]
+myteams <- subset(myteams, yearID != 1994)
+myteams$RD <- with(myteams, R-RA)
+myteams$Wpct <- with(myteams, W/(W+L))
+myteams <- myteams[,-1]
+#linear model to predict winning percentage 
+plot(myteams$RD,myteams$Wpct,xlab="run diff",ylab="winning pct")
+linfit <- lm(Wpct ~ RD, data= myteams)
+abline(a=coef(linfit)[1],b=coef(linfit)[2], lwd=2)
+
+myteams$linWpct <- predict(linfit)
+
+myteams$resid <- residuals(linfit)
+myteams$DivWin <- factor(myteams$DivWin)
+max(myteams$resid)
+
+set.seed(2)
+train.index <- sample(c(1:dim(myteams)[1]), dim(myteams[1])*0.6)
+train.df <- myteams[train.index,]
+valid.df <- myteams[-train.index,]
+
+#Predict the DivWin variable using a classification tree
+
+library(rpart)
+library(rpart.plot)
+library(caret)
+train.df <- train.df[,-1:-4]
+class.tree <- rpart(DivWin ~ ., data= train.df, maxcompete=5, control= rpart.control(maxdepth = 7), method= "class")
+prp(class.tree, type = 1, extra = 1, split.font = 1, varlen = -10)
+trainpred <- predict(class.tree,train.df,type = "class")
+trainfac <- train.df$DivWin
+confusionMatrix(trainpred,trainfac)
+
+validfac<- valid.df$DivWin
+WWvec<- predict(class.tree,valid.df,type = "class")
+confusionMatrix(WWvec,validfac)
+
+
+dfpred <- predict(class.tree,myteams,type = "class")
+confusionMatrix(dfpred,myteams$DivWin)
+myteams$predDivWin <- dfpred
+
+library(ROSE)
+
+over.sample <- ovun.sample(WSWin ~ .,data = myteams,method = "under", 200)$data
+table(over.sample$WSWin)
+under.tree <- rpart(WSWin ~., data = over.sample)
+prp(under.tree, type = 1, extra = 1, split.font = 1, varlen = -10)
+
+confusionMatrix(factor(predict(under.tree,myteams,type = "class")),factor(myteams$WSWin))
+
+
+
+#///random forest
+
+
+library(randomForest)
+
+rf <- randomForest(as.factor(WSWin) ~ ., data= over.sample[,-1], ntree=500, mtry=4, nodesize=5, importance=TRUE)
+
+varImpPlot(rf, type=1)
+
+rf.pred <- predict(rf,myteams)
+confusionMatrix(factor(rf.pred), factor(myteams$WSWin))
+
+
+#///boosted tree
+
+library(C50)
+boostedTree <- C5.0(x=over.sample[,c(-9,-13)], y=as.factor(over.sample$WSWin), trials=10)
+
+summary(boostedTree)
+boost.pred.train <- predict(boostedTree, myteams[,c(-9,-13)])
+confusionMatrix(boost.pred.train, factor(myteams$WSWin))
+
+
+#neural nets 
+
+library(neuralnet)
+
+library(nnet)
+yes <- ifelse(over.sample$WSWin == "Y" , 1,0)
+no <- 1-yes
+nndivwin <- ifelse(over.sample$predDivWin=="Y",1,0)
+nndfr <- data.frame(Wpct=over.sample$linWpct,DivWin=nndivwin,Yes=yes,No=no)
+
+nn <- neuralnet(Yes+No ~ Wpct+DivWin, data=nndfr, hidden=4, linear.output = FALSE,threshold = 0.01)
+
+
+
+
+
+# Plot network
+plot(nn,rep="best")
+
+
+numdivwin <- ifelse(myteams$predDivWin=="Y",1,0)
+predict <- compute(nn, data.frame(myteams$linWpct, numdivwin))
+predicted.class=apply(predict$net.result, 1, which.max)
+confusionMatrix(factor(ifelse(predicted.class==1, "Y", "N")), factor(ifelse(myteams$WSWin=="Y", "Y", "N")))
+
+
+
+#get rosters for a team given a year
+
+batting <- read.csv("batting.csv")
+mybatting <- subset(batting, yearID > 1968)
+
+#ML4 is the Milwaukee Brewers, change to make it consistent
+mybatting$teamID <- gsub("ML4","MIL",mybatting$teamID)
+
+#a function to return a teams starting roster for a season
+
+getRoster <- function(tID, yID){
+  
+
+df <- mybatting[mybatting$teamID == tID,]
+df <- df[df$yearID == yID,]
+df <- df[df$stint == 1,]
+df$playerID <- as.character(df$playerID)
+return(df)
+}
+
+
+## add up players rbi's for the previous season
+
+
+
+lastR <- function(tid,yid){
+
+  dfdf <- getRoster(tid,yid)
+  dummyvec <- dfdf$playerID
+  dummyr <- 0
+
+  for (x in c(1:length(dummyvec))) {
+  
+    place <- sum(mybatting$R[mybatting$playerID == dummyvec[x] & mybatting$yearID == yid - 1])
+   dummyr <- dummyr + place
+
+  }
+
+  return(dummyr)
+}
+lastR("MIL",1970)
+
+
+getrframe <- function(yid){
+  dummyframe <- myteams[myteams$yearID == yid, ]
+  dummyframe <- dummyframe[,c(1,5)]
+  dumvec <- c(NULL)
+  for (x in c(1:length(dummyframe$teamID))) {
+    dumval <- lastR(dummyframe$teamID[x],yid)
+    dumvec <- append(dumvec,dumval)
+  }
+  dummyframe$lastR <- dumvec
+  return(dummyframe)
+}
+frame2010 <- getrframe(2010)
+plot(frame2010$R ~ frame2010$lastR)
+#not a good fit, all over the place
